@@ -1,3 +1,4 @@
+#define Uses_TEventPoll
 #include <internal/events.h>
 #include <chrono>
 using time_point = std::chrono::steady_clock::time_point;
@@ -134,64 +135,22 @@ static bool fdEmpty(int fd) noexcept
     return ioctl(fd, FIONREAD, &nbytes) == -1 || !nbytes;
 }
 
-#ifdef __APPLE__
+static TEventPoll::Function pollFunction = &TEventPoll::defaultFunction;
 
 static void pollHandles(PollData &pd, int ms) noexcept
 {
     auto &fds = pd.handles;
     auto &states = pd.states;
-    // We use 'select' instead of 'poll' on macOS because 'poll' does not work
-    // with terminal devices in some of its versions (see magiblot/turbo#65).
-    // However, 'select' only supports file descriptors from 0 to
-    // 'FD_SETSIZE' - 1, others are not waited for.
-    fd_set readFds;
-    FD_ZERO(&readFds);
-    int maxFd = -1;
-    for (size_t i = 0; i < fds.size(); ++i)
-        if (0 <= fds[i] && fds[i] < FD_SETSIZE)
-        {
-            FD_SET(fds[i], &readFds);
-            if (fds[i] > maxFd)
-                maxFd = fds[i];
-        }
-
-    if (maxFd >= 0)
-    {
-        struct timeval timeout;
-        timeout.tv_sec = ms/1000;
-        timeout.tv_usec = ms%1000*1000;
-        if ( select( maxFd + 1, &readFds, nullptr, nullptr,
-                     (ms < 0 ? nullptr : &timeout) ) >= 0 )
-            for (size_t i = 0; i < fds.size(); ++i)
-                if ( 0 <= fds[i] && fds[i] < FD_SETSIZE &&
-                     FD_ISSET(fds[i], &readFds) )
-                {
-                    if (fdEmpty(fds[i]))
-                        states[i] = psDisconnect;
-                    else
-                        states[i] = psReady;
-                }
-    }
-}
-
-#else
-
-static void pollHandles(PollData &pd, int ms) noexcept
-{
-    auto &fds = pd.handles;
-    auto &states = pd.states;
-    // Unlike 'select', 'poll' supports file descriptors of any number, which
-    // matters when the application has opened many files before the terminal.
-    // Negative ones are not waited for.
     auto &items = pd.items;
     items.resize(fds.size());
     for (size_t i = 0; i < fds.size(); ++i)
     {
         items[i].fd = fds[i];
         items[i].events = POLLIN;
+        items[i].revents = 0;
     }
 
-    if (poll(items.data(), items.size(), ms) > 0)
+    if (pollFunction(items.data(), items.size(), ms) > 0)
         for (size_t i = 0; i < items.size(); ++i)
         {
             if ( (items[i].revents & POLLHUP) ||
@@ -203,8 +162,6 @@ static void pollHandles(PollData &pd, int ms) noexcept
                 states[i] = psReady;
         }
 }
-
-#endif // __APPLE__
 
 #else
 
@@ -336,3 +293,56 @@ void EventWaiter::interruptEventWait() noexcept
 }
 
 } // namespace tvision
+
+#ifdef _TV_UNIX
+
+int TEventPoll::defaultFunction( struct pollfd *fds, size_t count,
+                                 int timeoutMs ) noexcept
+{
+#ifdef __APPLE__
+    // We use 'select' instead of 'poll' on macOS because 'poll' does not work
+    // with terminal devices such as /dev/tty (see magiblot/turbo#65).
+    // However, 'select' only supports file descriptors from 0 to
+    // 'FD_SETSIZE' - 1, others are not waited for.
+    fd_set readFds;
+    FD_ZERO(&readFds);
+    int maxFd = -1;
+    for (size_t i = 0; i < count; ++i)
+        if (0 <= fds[i].fd && fds[i].fd < FD_SETSIZE)
+        {
+            FD_SET(fds[i].fd, &readFds);
+            if (fds[i].fd > maxFd)
+                maxFd = fds[i].fd;
+        }
+
+    int ready = 0;
+    if (maxFd >= 0)
+    {
+        struct timeval timeout;
+        timeout.tv_sec = timeoutMs/1000;
+        timeout.tv_usec = timeoutMs%1000*1000;
+        if ( select( maxFd + 1, &readFds, nullptr, nullptr,
+                     (timeoutMs < 0 ? nullptr : &timeout) ) >= 0 )
+            for (size_t i = 0; i < count; ++i)
+                if ( 0 <= fds[i].fd && fds[i].fd < FD_SETSIZE &&
+                     FD_ISSET(fds[i].fd, &readFds) )
+                {
+                    fds[i].revents = POLLIN;
+                    ++ready;
+                }
+    }
+    return ready;
+#else
+    // Unlike 'select', 'poll' supports file descriptors of any number, which
+    // matters when the application has opened many files before the terminal.
+    // Negative ones are not waited for.
+    return poll(fds, count, timeoutMs);
+#endif
+}
+
+void TEventPoll::setFunction( Function function ) noexcept
+{
+    tvision::pollFunction = function ? function : &defaultFunction;
+}
+
+#endif // _TV_UNIX
